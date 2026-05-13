@@ -100,12 +100,20 @@ def main():
         if rank == 0:
             print(*args, **kwargs)
 
+    if rank != 0:
+        from huggingface_hub import logging as hf_logging
+        from huggingface_hub.utils import disable_progress_bars
+
+        hf_logging.set_verbosity_error()
+        disable_progress_bars()
+
     mx.random.seed(args.seed)
 
     if group.size() > 1:
         if args.adapter_path:
             parser.error("Adapters not supported in distributed mode")
         model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
+        rprint(f"[INFO] Loaded and sharded on {group.size()} machines.")
     else:
         model, tokenizer = load(
             args.model,
