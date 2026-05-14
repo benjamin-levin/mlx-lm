@@ -23,6 +23,7 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
+from tqdm import tqdm
 
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
@@ -747,7 +748,7 @@ def save_model(
     weights.clear()
     del weights
 
-    for i in range(len(shards)):
+    for i in tqdm(range(len(shards)), desc="Saving shards", unit="shard"):
         shard = shards[i]
         shards[i] = None
         shard_name = shard_file_format.format(i + 1, shards_count)
