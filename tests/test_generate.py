@@ -1107,5 +1107,208 @@ class TestPromptLookupDecoding(unittest.TestCase):
         self.assertEqual(baseline, with_snapkv)
 
 
+class TestAutoSpeculative(unittest.TestCase):
+    """Tests for prompt-lookup decoding + auto-speculative router opt-in flags.
+
+    These tests cover argument-parsing, helper-function correctness, and
+    smoke import-paths. They do not exercise a full PLD/AR decode loop —
+    that is covered indirectly by ``test_stream_generate_speculative`` and
+    by the companion fork's regression suite.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+        cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
+        cls.model.set_dtype(mx.float32)
+
+    def test_module_exports_new_symbols(self):
+        # New public symbols added by the auto-speculative router patch.
+        from mlx_lm.generate import (
+            _auto_spec_score,
+            _pld_find_draft,
+            auto_speculative_generate_step,
+            prompt_lookup_generate_step,
+        )
+
+        self.assertTrue(callable(auto_speculative_generate_step))
+        self.assertTrue(callable(prompt_lookup_generate_step))
+        self.assertTrue(callable(_pld_find_draft))
+        self.assertTrue(callable(_auto_spec_score))
+
+    def test_setup_arg_parser_defaults(self):
+        # Both flags default off: default behavior must be unchanged.
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--prompt", "hi"])
+        self.assertFalse(args.auto_speculative)
+        self.assertIsNone(args.prompt_lookup_num_tokens)
+
+    def test_setup_arg_parser_auto_speculative_flag(self):
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--prompt", "hi", "--auto-speculative"])
+        self.assertTrue(args.auto_speculative)
+        self.assertIsNone(args.prompt_lookup_num_tokens)
+
+    def test_setup_arg_parser_prompt_lookup_flag(self):
+        from mlx_lm.generate import setup_arg_parser
+
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--prompt", "hi", "--prompt-lookup-num-tokens", "5"])
+        self.assertFalse(args.auto_speculative)
+        self.assertEqual(args.prompt_lookup_num_tokens, 5)
+
+    def test_pld_find_draft_basic_match(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        # Prompt contains the bigram (4, 5); after a match on (4, 5) the
+        # next two tokens (6, 7) should be returned as the draft.
+        prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+        generated = [9, 4, 5]
+        draft = _pld_find_draft(generated, prompt, k_lookback=2, k_lookahead=2)
+        self.assertEqual(draft, [6, 7])
+
+    def test_pld_find_draft_no_match_returns_empty(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        prompt = [1, 2, 3, 4, 5]
+        generated = [98, 99]
+        draft = _pld_find_draft(generated, prompt, k_lookback=2, k_lookahead=3)
+        self.assertEqual(draft, [])
+
+    def test_pld_find_draft_empty_inputs(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        self.assertEqual(
+            _pld_find_draft([], [1, 2, 3], k_lookback=2, k_lookahead=2), []
+        )
+        self.assertEqual(_pld_find_draft([1, 2], [], k_lookback=2, k_lookahead=2), [])
+
+    def test_pld_find_draft_prefers_longer_match(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        # Suffix (7, 8, 9) appears at one site; suffix (8, 9) appears
+        # at two sites. Longer match wins.
+        prompt = [1, 2, 3, 7, 8, 9, 100, 200, 8, 9, 300]
+        generated = [5, 6, 7, 8, 9]
+        draft = _pld_find_draft(generated, prompt, k_lookback=3, k_lookahead=1)
+        self.assertEqual(draft, [100])
+
+    def test_pld_find_draft_no_continuation(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        # Match exists at the very end of the prompt: no follow-on tokens.
+        prompt = [1, 2, 3, 4, 5]
+        generated = [4, 5]
+        draft = _pld_find_draft(generated, prompt, k_lookback=2, k_lookahead=3)
+        self.assertEqual(draft, [])
+
+    def test_auto_spec_score_short_prompt_is_zero(self):
+        from mlx_lm.generate import _auto_spec_score
+
+        score = _auto_spec_score(list(range(50)))
+        self.assertEqual(score, 0.0)
+
+    def test_auto_spec_score_long_prompt_is_positive(self):
+        from mlx_lm.generate import _auto_spec_score
+
+        # Long + highly repetitive prompt (10-token cycle * 200 = 2000
+        # tokens; bigram density is essentially 1.0).
+        repetitive = ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) * 200
+        score = _auto_spec_score(repetitive)
+        self.assertGreater(score, 0.5)
+
+    def test_auto_spec_score_in_unit_interval(self):
+        from mlx_lm.generate import _auto_spec_score
+
+        random.seed(0)
+        for n in (300, 600, 1500, 5000):
+            prompt = [random.randint(0, 1000) for _ in range(n)]
+            score = _auto_spec_score(prompt)
+            self.assertGreaterEqual(score, 0.0)
+            self.assertLessEqual(score, 1.0)
+
+    def test_stream_generate_default_behavior_unchanged(self):
+        # With neither auto_speculative nor prompt_lookup_num_tokens set,
+        # output must match plain AR token-for-token under a determinate
+        # sampler.
+        sampler = make_sampler(temp=0.0)
+        prompt = self.tokenizer.encode("hello")
+
+        baseline = []
+        for r in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=4,
+            sampler=sampler,
+        ):
+            baseline.append(r.token)
+
+        explicit_off = []
+        for r in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=4,
+            sampler=sampler,
+            auto_speculative=False,
+            prompt_lookup_num_tokens=None,
+        ):
+            explicit_off.append(r.token)
+
+        self.assertEqual(baseline, explicit_off)
+
+    def test_stream_generate_auto_speculative_short_prompt(self):
+        # Short-prompt path of the router: must run cleanly and yield
+        # max_tokens tokens (falls back to AR internally).
+        sampler = make_sampler(temp=0.0)
+        prompt = self.tokenizer.encode("hello")
+
+        tokens = []
+        for r in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=3,
+            sampler=sampler,
+            auto_speculative=True,
+        ):
+            tokens.append(r.token)
+
+        self.assertEqual(len(tokens), 3)
+
+    def test_stream_generate_auto_speculative_rejects_draft_model(self):
+        # Auto-spec is mutually exclusive with draft_model.
+        prompt = self.tokenizer.encode("hello")
+        with self.assertRaises(ValueError):
+            for _ in stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt,
+                max_tokens=2,
+                draft_model=self.model,
+                auto_speculative=True,
+            ):
+                pass
+
+    def test_stream_generate_prompt_lookup_rejects_draft_model(self):
+        # PLD direct path is also mutually exclusive with draft_model.
+        prompt = self.tokenizer.encode("hello")
+        with self.assertRaises(ValueError):
+            for _ in stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt,
+                max_tokens=2,
+                draft_model=self.model,
+                prompt_lookup_num_tokens=4,
+            ):
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()
