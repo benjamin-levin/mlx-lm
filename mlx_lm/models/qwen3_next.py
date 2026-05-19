@@ -55,7 +55,7 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
 
 
-@partial(mx.compile, shapeless=True)
+@mx.compile
 def _precise_swiglu(h, gate, x):
     gate = nn.silu(gate.astype(mx.float32))
     x = x.astype(mx.float32)
@@ -322,7 +322,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 # coupling and no fallback path to maintain.
 
 
-@partial(mx.compile, shapeless=True)
+@mx.compile
 def _moe_route_norm(gates_logits, k):
     """Softmax -> top-k indices -> normalised top-k scores."""
     gates = mx.softmax(gates_logits, axis=-1, precise=True)
@@ -332,7 +332,7 @@ def _moe_route_norm(gates_logits, k):
     return inds, scores
 
 
-@partial(mx.compile, shapeless=True)
+@mx.compile
 def _moe_route_raw(gates_logits, k):
     """Softmax -> top-k indices -> raw (unnormalised) top-k scores."""
     gates = mx.softmax(gates_logits, axis=-1, precise=True)
@@ -341,7 +341,7 @@ def _moe_route_raw(gates_logits, k):
     return inds, scores
 
 
-@partial(mx.compile, shapeless=True)
+@mx.compile
 def _moe_combine(expert_out, scores, shared_y, shared_gate_logit):
     """Weighted expert sum + sigmoid-gated shared output."""
     y = (expert_out * scores[..., None]).sum(axis=-2)
