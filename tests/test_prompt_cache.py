@@ -769,5 +769,234 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(mask, expected))
 
 
+class TestDiskPromptCache(unittest.TestCase):
+    """Tests for the opt-in disk-backed persistence layer."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="mlx_lm_disk_cache_test_")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_cache(self, num_layers=2, seq=8, head_dim=4, num_heads=2):
+        cache = [KVCache() for _ in range(num_layers)]
+        for c in cache:
+            x = mx.random.uniform(shape=(1, num_heads, seq, head_dim))
+            c.update_and_fetch(x, x)
+        return cache
+
+    # ------------------------------------------------------------------
+    # hash_tokens determinism
+    # ------------------------------------------------------------------
+    def test_hash_tokens_is_deterministic(self):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        h1 = hash_tokens(tokens, "model-a")
+        h2 = hash_tokens(list(tokens), "model-a")
+        self.assertEqual(h1, h2)
+        # 64-char sha256 hex
+        self.assertEqual(len(h1), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in h1))
+
+    def test_hash_tokens_changes_on_model_or_tokens(self):
+        from mlx_lm.disk_prompt_cache import hash_tokens
+
+        base = hash_tokens([1, 2, 3], "model-a")
+        self.assertNotEqual(base, hash_tokens([1, 2, 3], "model-b"))
+        self.assertNotEqual(base, hash_tokens([1, 2, 4], "model-a"))
+        self.assertNotEqual(base, hash_tokens([1, 2, 3, 4], "model-a"))
+
+    # ------------------------------------------------------------------
+    # DiskPromptCacheIndex round-trip
+    # ------------------------------------------------------------------
+    def test_disk_index_save_load_roundtrip(self):
+        from pathlib import Path
+
+        from mlx_lm.disk_prompt_cache import DiskPromptCacheIndex
+
+        cache = self._make_cache()
+        tokens = list(range(300))
+
+        index = DiskPromptCacheIndex(
+            Path(self._tmp),
+            "model-a",
+            size_budget_bytes=10 * (1024**3),
+            min_prefix_tokens=256,
+        )
+        self.assertFalse(index.has(tokens))
+        self.assertTrue(index.put(tokens, cache))
+        self.assertTrue(index.has(tokens))
+
+        loaded = index.get(tokens)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(len(loaded), len(cache))
+        for orig, lc in zip(cache, loaded):
+            self.assertEqual(orig.offset, lc.offset)
+            self.assertTrue(mx.array_equal(orig.state[0], lc.state[0]))
+            self.assertTrue(mx.array_equal(orig.state[1], lc.state[1]))
+
+    def test_disk_index_skips_below_min_tokens(self):
+        from pathlib import Path
+
+        from mlx_lm.disk_prompt_cache import DiskPromptCacheIndex
+
+        cache = self._make_cache()
+        index = DiskPromptCacheIndex(
+            Path(self._tmp),
+            "model-a",
+            min_prefix_tokens=256,
+        )
+        short_tokens = list(range(10))
+        self.assertFalse(index.put(short_tokens, cache))
+        self.assertFalse(index.has(short_tokens))
+
+    def test_disk_index_model_id_isolation(self):
+        from pathlib import Path
+
+        from mlx_lm.disk_prompt_cache import DiskPromptCacheIndex
+
+        cache = self._make_cache()
+        tokens = list(range(300))
+
+        index_a = DiskPromptCacheIndex(Path(self._tmp), "model-a")
+        index_b = DiskPromptCacheIndex(Path(self._tmp), "model-b")
+        self.assertTrue(index_a.put(tokens, cache))
+        # Different model_id hashes to a different key -> miss
+        self.assertFalse(index_b.has(tokens))
+        self.assertIsNone(index_b.get(tokens))
+
+    # ------------------------------------------------------------------
+    # LRUPromptCache: default behavior unchanged when disk_cache_dir=None
+    # ------------------------------------------------------------------
+    def test_lru_prompt_cache_default_is_memory_only(self):
+        from mlx_lm.models.cache import LRUPromptCache
+
+        lpc = LRUPromptCache(disk_cache_dir=None)
+        self.assertIsNone(lpc._disk_cache_dir)
+        cache = self._make_cache()
+        tokens = list(range(300))
+        lpc.insert_cache("model-a", tokens, cache)
+        # No files should ever land in the test-owned tmpdir.
+        self.assertEqual(os.listdir(self._tmp), [])
+        # And a fresh same-model fetch should still hit in-memory.
+        got, rest = lpc.fetch_nearest_cache("model-a", tokens)
+        self.assertIsNotNone(got)
+        self.assertEqual(rest, [])
+
+    # ------------------------------------------------------------------
+    # LRUPromptCache: write-through + cold-start re-materialization
+    # ------------------------------------------------------------------
+    def test_lru_prompt_cache_writes_through_to_disk(self):
+        from mlx_lm.models.cache import LRUPromptCache
+
+        cache = self._make_cache()
+        tokens = list(range(300))
+
+        lpc = LRUPromptCache(
+            disk_cache_dir=self._tmp,
+            disk_cache_min_tokens=256,
+        )
+        lpc.insert_cache("model-a", tokens, cache)
+
+        # Sidecar + safetensors should be present on disk.
+        files = sorted(os.listdir(self._tmp))
+        self.assertTrue(
+            any(f.endswith(".safetensors") for f in files),
+            f"expected a safetensors file, got {files}",
+        )
+        self.assertTrue(
+            any(f.endswith(".meta.json") for f in files),
+            f"expected a sidecar meta file, got {files}",
+        )
+
+    def test_lru_prompt_cache_reads_back_on_cold_start(self):
+        from mlx_lm.models.cache import LRUPromptCache
+
+        cache = self._make_cache()
+        tokens = list(range(300))
+
+        # Phase 1: writer process - populate disk.
+        writer = LRUPromptCache(
+            disk_cache_dir=self._tmp,
+            disk_cache_min_tokens=256,
+        )
+        writer.insert_cache("model-a", tokens, cache)
+
+        # Phase 2: simulate a fresh process by constructing a brand-new
+        # LRUPromptCache pointing at the same disk directory.
+        reader = LRUPromptCache(
+            disk_cache_dir=self._tmp,
+            disk_cache_min_tokens=256,
+        )
+        # In-memory trie is empty - fetch must re-materialize from disk.
+        got, rest = reader.fetch_nearest_cache("model-a", tokens)
+        self.assertIsNotNone(got, "cold-start disk re-materialization failed")
+        # Exact-prefix hit returns full cache + empty tail.
+        self.assertEqual(rest, [])
+        self.assertEqual(len(got), len(cache))
+        for orig, lc in zip(cache, got):
+            self.assertEqual(orig.offset, lc.offset)
+            self.assertTrue(mx.array_equal(orig.state[0], lc.state[0]))
+
+    def test_lru_prompt_cache_skips_disk_below_min_tokens(self):
+        from mlx_lm.models.cache import LRUPromptCache
+
+        cache = self._make_cache()
+        short = list(range(10))
+
+        lpc = LRUPromptCache(
+            disk_cache_dir=self._tmp,
+            disk_cache_min_tokens=256,
+        )
+        lpc.insert_cache("model-a", short, cache)
+        # Nothing on disk because we're below threshold.
+        self.assertEqual(os.listdir(self._tmp), [])
+
+    # ------------------------------------------------------------------
+    # LRU byte-budget eviction
+    # ------------------------------------------------------------------
+    def test_disk_byte_budget_eviction(self):
+        import time
+
+        from mlx_lm.models.cache import LRUPromptCache
+
+        # Build two caches that comfortably exceed a tiny byte budget.
+        cache_a = self._make_cache(num_layers=2, seq=8, head_dim=4)
+        cache_b = self._make_cache(num_layers=2, seq=8, head_dim=4)
+        on_disk_bytes_per_entry = sum(c.nbytes for c in cache_a)
+
+        # Pick a budget that fits exactly one of the two entries.
+        budget = on_disk_bytes_per_entry + on_disk_bytes_per_entry // 4
+
+        lpc = LRUPromptCache(
+            disk_cache_dir=self._tmp,
+            disk_cache_bytes=budget,
+            disk_cache_min_tokens=4,  # low threshold for test
+        )
+
+        tokens_a = list(range(300))
+        tokens_b = list(range(300, 600))
+
+        lpc.insert_cache("model-a", tokens_a, cache_a)
+        # Ensure last_used_at ordering is unambiguous.
+        time.sleep(0.01)
+        lpc.insert_cache("model-a", tokens_b, cache_b)
+
+        # After eviction we should have at most 1 safetensors file
+        # remaining (the most recently used).
+        st_files = [f for f in os.listdir(self._tmp) if f.endswith(".safetensors")]
+        self.assertLessEqual(
+            len(st_files),
+            1,
+            f"expected eviction to leave <=1 entry, got {st_files}",
+        )
+        meta_files = [f for f in os.listdir(self._tmp) if f.endswith(".meta.json")]
+        # Sidecar should be evicted alongside its safetensors.
+        self.assertEqual(len(meta_files), len(st_files))
+
+
 if __name__ == "__main__":
     unittest.main()
