@@ -1021,6 +1021,90 @@ class TestPromptLookupDecoding(unittest.TestCase):
                 prompt_lookup_num_tokens=2,
             ):
                 pass
+    def test_generate_step_snapkv_none_is_default(self):
+        # Passing snapkv=None must not change the token sequence vs the
+        # default (snapkv kwarg omitted entirely).
+        prompt = mx.array(self.tokenizer.encode("hello world"))
+        baseline = []
+        for tok, _ in generate_step(
+            prompt, self.model, max_tokens=8, sampler=lambda x: mx.argmax(x, axis=-1)
+        ):
+            baseline.append(int(tok.item()))
+        with_kwarg = []
+        for tok, _ in generate_step(
+            prompt,
+            self.model,
+            max_tokens=8,
+            sampler=lambda x: mx.argmax(x, axis=-1),
+            snapkv=None,
+        ):
+            with_kwarg.append(int(tok.item()))
+        self.assertEqual(baseline, with_kwarg)
+
+    def test_generate_step_snapkv_min_ctx_gate_skips_short_prompt(self):
+        # With min_ctx set above the prompt length, SnapKV must short-circuit
+        # before touching the model and produce the same tokens as snapkv=None.
+        prompt = mx.array(self.tokenizer.encode("hello world"))
+        baseline = []
+        for tok, _ in generate_step(
+            prompt, self.model, max_tokens=8, sampler=lambda x: mx.argmax(x, axis=-1)
+        ):
+            baseline.append(int(tok.item()))
+        gated = []
+        for tok, _ in generate_step(
+            prompt,
+            self.model,
+            max_tokens=8,
+            sampler=lambda x: mx.argmax(x, axis=-1),
+            snapkv={"min_ctx": 10**9},
+        ):
+            gated.append(int(tok.item()))
+        self.assertEqual(baseline, gated)
+
+    def test_generate_step_snapkv_skips_when_cache_already_populated(self):
+        # _maybe_snapkv_prefill must not fire if the prompt cache is already
+        # populated (mid-conversation reuse path). It detects that via
+        # prompt_cache[0].offset > 0 and falls through to the standard path.
+        from mlx_lm.models.cache import make_prompt_cache
+
+        prompt = mx.array(self.tokenizer.encode("hello world"))
+
+        # Pre-populate the cache by running one step manually.
+        warm = make_prompt_cache(self.model)
+        _ = self.model(prompt[None], cache=warm)
+        mx.eval(_)
+        self.assertGreater(warm[0].offset, 0)
+
+        # min_ctx low enough to attempt SnapKV, but pre-populated cache
+        # should force the fallback. Output should match a fresh-cache run
+        # under the same warmed-cache continuation prompt.
+        next_prompt = mx.array(self.tokenizer.encode(" how are you"))
+
+        warm_copy = make_prompt_cache(self.model)
+        _ = self.model(prompt[None], cache=warm_copy)
+        mx.eval(_)
+
+        baseline = []
+        for tok, _ in generate_step(
+            next_prompt,
+            self.model,
+            max_tokens=4,
+            sampler=lambda x: mx.argmax(x, axis=-1),
+            prompt_cache=warm_copy,
+        ):
+            baseline.append(int(tok.item()))
+
+        with_snapkv = []
+        for tok, _ in generate_step(
+            next_prompt,
+            self.model,
+            max_tokens=4,
+            sampler=lambda x: mx.argmax(x, axis=-1),
+            prompt_cache=warm,
+            snapkv={"min_ctx": 1},  # would fire but for the populated-cache gate
+        ):
+            with_snapkv.append(int(tok.item()))
+        self.assertEqual(baseline, with_snapkv)
 
 
 if __name__ == "__main__":

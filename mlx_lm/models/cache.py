@@ -486,6 +486,114 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class SnapKVCache(_BaseCache):
+    """Fixed-shape KV cache for SnapKV-style content-aware compression.
+
+    Constructed by :func:`mlx_lm.snapkv.snapkv_prefill_and_trim` after a
+    one-shot prefill of the prompt: K/V positions are scored using the last
+    ``obs_window`` queries, top-K positions are kept (plus an attention
+    sink and a recent-tokens window), and the un-selected K/V entries are
+    physically dropped.
+
+    The cache layout (axis=2 is sequence):
+
+    ``[ 0 : n_pin )           pinned (sink + selected middle positions)``
+    ``[ n_pin : n_keep )      sliding recent-tokens window``
+
+    During decode, new K/V enters at the tail of the recent window and the
+    oldest recent entry is evicted, so the buffer shape is **constant**
+    across decode steps. This keeps MLX's
+    ``mx.fast.scaled_dot_product_attention`` kernel plan stable across
+    iterations.
+
+    The kept K vectors retain their original RoPE positions; they are
+    **not** re-encoded after trim. The ``offset`` property therefore
+    returns the *logical* prompt length (so the next query's RoPE offset
+    is correct) rather than the smaller physical cache length.
+
+    This cache is **not trimmable** (``trim_prompt_cache`` will refuse it),
+    not quantizable, and not persistable: it represents a lossy summary
+    of the prompt, not the full prompt.
+    """
+
+    def __init__(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        logical_offset: int,
+        *,
+        n_pin: int,
+    ):
+        B, KV_H, n_keep, _ = keys.shape
+        if n_pin > n_keep:
+            raise ValueError(f"n_pin={n_pin} > n_keep={n_keep}")
+        self._n_keep = int(n_keep)
+        self._n_pin = int(n_pin)
+        self.keys = keys
+        self.values = values
+        self._logical = int(logical_offset)
+
+    @property
+    def offset(self) -> int:
+        return self._logical
+
+    @offset.setter
+    def offset(self, value: int) -> None:
+        self._logical = int(value)
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        # Slide the recent-tokens window: pinned | recent[L:] | new.
+        L = keys.shape[-2]
+        n_pin = self._n_pin
+        n_keep = self._n_keep
+        self.keys = mx.concatenate(
+            [
+                self.keys[..., :n_pin, :],
+                self.keys[..., n_pin + L : n_keep, :],
+                keys,
+            ],
+            axis=-2,
+        )
+        self.values = mx.concatenate(
+            [
+                self.values[..., :n_pin, :],
+                self.values[..., n_pin + L : n_keep, :],
+                values,
+            ],
+            axis=-2,
+        )
+        self._logical += L
+        return self.keys, self.values
+
+    def size(self) -> int:
+        return self._n_keep
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self._n_keep = self.keys.shape[-2]
+
+    def is_trimmable(self) -> bool:
+        return False
+
+    @property
+    def nbytes(self) -> int:
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+    def empty(self) -> bool:
+        return self.keys is None
+
+    def make_mask(self, *args, **kwargs):
+        # Buffer is fully populated; no masking required for SDPA.
+        return None
+
+
 class RotatingKVCache(_BaseCache):
     step = 256
 

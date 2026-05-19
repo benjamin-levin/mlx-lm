@@ -13,6 +13,7 @@ from functools import partial
 from typing import (
     Any,
     Callable,
+    Dict,
     Generator,
     List,
     Optional,
@@ -312,6 +313,58 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+def _maybe_snapkv_prefill(
+    *,
+    prompt: mx.array,
+    model: nn.Module,
+    prompt_cache,
+    opts: Dict[str, Any],
+    prefill_step_size: int,
+) -> mx.array:
+    """Run SnapKV prefill+trim in place on ``prompt_cache``.
+
+    Returns the portion of the prompt still to be consumed by the caller --
+    SnapKV consumes ``prompt[:-1]`` and leaves the final token for the
+    regular ``generate_step`` decode path so logits_processors / sampler /
+    quantize hooks fire normally on the first emitted token.
+
+    Returns the original ``prompt`` unchanged if SnapKV is skipped (prompt
+    shorter than ``min_ctx``, ``prompt_cache`` already populated, model is
+    not Qwen3-Next, etc.).
+    """
+    prompt_len = int(prompt.shape[0])
+    min_ctx = int(opts.get("min_ctx", 49152))
+    if prompt_len < max(2, min_ctx):
+        return prompt
+    if prompt_cache and getattr(prompt_cache[0], "offset", 0) > 0:
+        return prompt
+    try:
+        from .snapkv import patch_for_snapkv, snapkv_prefill_and_trim
+    except ImportError:
+        return prompt
+
+    obs_window = int(opts.get("obs_window", 32))
+    try:
+        patch_for_snapkv(model, obs_window=obs_window)
+    except ImportError:
+        return prompt
+
+    head = prompt[:-1]
+    tail = prompt[-1:]
+    new_cache, _ = snapkv_prefill_and_trim(
+        model,
+        head,
+        top_k=int(opts.get("top_k", 4096)),
+        n_sink=int(opts.get("n_sink", 128)),
+        n_window=int(opts.get("n_window", 512)),
+        obs_window=obs_window,
+        pool_kernel=int(opts.get("pool_kernel", 1)),
+        prefill_chunk=int(opts.get("prefill_chunk", prefill_step_size)),
+    )
+    prompt_cache[:] = new_cache
+    return tail
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -327,6 +380,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    snapkv: Optional[Dict[str, Any]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -355,6 +409,14 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        snapkv (dict, optional): If provided, enable SnapKV content-aware
+          KV-cache compression for long-context prompts. Recognized keys:
+          ``top_k`` (default 4096), ``n_sink`` (default 128), ``n_window``
+          (default 512), ``obs_window`` (default 32), ``pool_kernel``
+          (default 1), ``min_ctx`` (default 49152). SnapKV is skipped for
+          prompts shorter than ``min_ctx``. Only takes effect on models
+          exposing the Qwen3-Next attention class. See ``mlx_lm.snapkv``.
+          Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -380,6 +442,20 @@ def generate_step(
         prompt_cache = cache.make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
+        )
+
+    # Optional: SnapKV content-aware KV compression for long-context prompts.
+    # Performs an extra prefill pass that captures attention scores from the
+    # final ``obs_window`` queries, scores each cached K position, and
+    # physically drops the un-selected entries. Only fires when the prompt is
+    # long enough (``min_ctx``) and the model exposes Qwen3-Next attention.
+    if snapkv is not None and input_embeddings is None and len(prompt) > 0:
+        prompt = _maybe_snapkv_prefill(
+            prompt=prompt,
+            model=model,
+            prompt_cache=prompt_cache,
+            opts=snapkv,
+            prefill_step_size=prefill_step_size,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
