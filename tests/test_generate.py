@@ -807,5 +807,155 @@ class TestGenerate(unittest.TestCase):
                     self.assertIsInstance(cache, KVCache)
 
 
+class TestPromptLookupDecoding(unittest.TestCase):
+    """Tests for Prompt Lookup Decoding (PLD) and its bit-exact rollback.
+
+    Mirrors the structure of TestGenerate: loads a small chat model once,
+    then runs pure-Python tests for the n-gram lookup helper plus
+    end-to-end tests against the model.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+        cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
+        cls.model.set_dtype(mx.float32)
+
+    def test_pld_find_draft_returns_match(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        prompt = [10, 20, 30, 40, 50, 60, 70]
+        generated = [99, 40, 50]
+        # last 2 generated == [40, 50], match in prompt at idx 3,4 -> next 3 are [60, 70]
+        out = _pld_find_draft(generated, prompt, k_lookback=2, k_lookahead=3)
+        self.assertEqual(out, [60, 70])
+
+    def test_pld_find_draft_no_match(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        prompt = [10, 20, 30]
+        generated = [100, 200, 300]
+        out = _pld_find_draft(generated, prompt, k_lookback=2, k_lookahead=3)
+        self.assertEqual(out, [])
+
+    def test_pld_find_draft_picks_most_recent(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        # Two matches; loop goes right-to-left and returns the most recent.
+        prompt = [1, 2, 3, 99, 1, 2, 4, 5]
+        generated = [9, 1, 2]
+        out = _pld_find_draft(generated, prompt, k_lookback=2, k_lookahead=2)
+        self.assertEqual(out, [4, 5])
+
+    def test_pld_find_draft_insufficient_history(self):
+        from mlx_lm.generate import _pld_find_draft
+
+        prompt = [1, 2, 3, 4]
+        generated = [1]  # k_lookback=2 > len(generated)
+        out = _pld_find_draft(generated, prompt, k_lookback=2, k_lookahead=2)
+        self.assertEqual(out, [])
+
+    def test_prompt_lookup_generate_step_yield_shape(self):
+        # Smoke test the step generator's output shape: each yield is
+        # (int_token, mx.array_logprobs, bool_from_draft).
+        from mlx_lm.generate import prompt_lookup_generate_step
+
+        prompt = self.tokenizer.encode("hello world", return_tensors="mlx")[0]
+        n = 0
+        for tok, lp, from_draft in prompt_lookup_generate_step(
+            prompt,
+            self.model,
+            prompt_lookup_num_tokens=3,
+            prompt_lookup_min_match=2,
+            max_tokens=4,
+        ):
+            self.assertIsInstance(tok, int)
+            self.assertIsInstance(lp, mx.array)
+            self.assertIsInstance(from_draft, bool)
+            n += 1
+        self.assertEqual(n, 4)
+
+    def test_prompt_lookup_generate_step_matches_ar(self):
+        # PLD with bit-exact rollback must yield the same tokens as plain
+        # auto-regressive decoding under the same (greedy) sampler.
+        from mlx_lm.generate import (
+            generate_step,
+            prompt_lookup_generate_step,
+        )
+
+        # A prompt with enough internal repetition to give PLD something
+        # to draft from (otherwise it just falls back to AR every step).
+        prompt = self.tokenizer.encode(
+            "The cat sat on the mat. The cat sat on the mat. The cat sat on",
+            return_tensors="mlx",
+        )[0]
+
+        ar_ids = []
+        for i, (tok, _) in enumerate(generate_step(prompt, self.model)):
+            ar_ids.append(tok)
+            if i + 1 == 8:
+                break
+
+        pld_ids = []
+        for tok, _, _ in prompt_lookup_generate_step(
+            prompt,
+            self.model,
+            prompt_lookup_num_tokens=4,
+            prompt_lookup_min_match=2,
+            max_tokens=8,
+        ):
+            pld_ids.append(tok)
+
+        self.assertEqual(pld_ids, ar_ids)
+
+    def test_prompt_lookup_generate_step_rejects_bad_args(self):
+        from mlx_lm.generate import prompt_lookup_generate_step
+
+        prompt = self.tokenizer.encode("hi", return_tensors="mlx")[0]
+        with self.assertRaises(ValueError):
+            next(
+                prompt_lookup_generate_step(
+                    prompt, self.model, prompt_lookup_num_tokens=0, max_tokens=1
+                )
+            )
+        with self.assertRaises(ValueError):
+            next(
+                prompt_lookup_generate_step(
+                    prompt, self.model, prompt_lookup_min_match=0, max_tokens=1
+                )
+            )
+
+    def test_stream_generate_prompt_lookup(self):
+        # End-to-end wiring: stream_generate(prompt_lookup_num_tokens=...)
+        # routes through prompt_lookup_generate_step and surfaces tokens.
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hello"}],
+            add_generation_prompt=True,
+        )
+        n = 0
+        for resp in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=4,
+            prompt_lookup_num_tokens=3,
+        ):
+            n += 1
+        self.assertEqual(n, 4)
+
+    def test_stream_generate_prompt_lookup_conflicts_with_draft(self):
+        # draft_model and prompt_lookup_num_tokens are mutually exclusive.
+        with self.assertRaises(ValueError):
+            for _ in stream_generate(
+                self.model,
+                self.tokenizer,
+                "hello",
+                max_tokens=2,
+                draft_model=self.model,
+                prompt_lookup_num_tokens=2,
+            ):
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()

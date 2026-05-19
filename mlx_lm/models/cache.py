@@ -111,6 +111,45 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def snapshot_prompt_cache(cache: List[Any]) -> List[Any]:
+    """
+    Snapshot the current state of every cache for exact rollback.
+
+    Unlike :func:`trim_prompt_cache`, this works for *all* cache types,
+    including non-trimmable recurrent caches (e.g. :class:`ArraysCache`
+    used by Gated Delta Net / Mamba-style models). Pair with
+    :func:`restore_prompt_cache` to revert the cache state after a
+    speculative-decoding verify forward.
+
+    The snapshot is taken by reference where possible (no tensor copy) and
+    is therefore cheap to take and discard. It is safe as long as the
+    cache implementations only *append* or *replace by reference* during
+    intervening forwards -- which is true of every built-in cache here.
+
+    Args:
+        cache (List[Any]): The model's cache.
+
+    Returns:
+        List[Any]: An opaque list of per-cache snapshots, suitable for
+            passing to :func:`restore_prompt_cache`.
+    """
+    return [c.snap() for c in cache]
+
+
+def restore_prompt_cache(cache: List[Any], snapshot: List[Any]) -> None:
+    """
+    Restore every cache to the state captured by
+    :func:`snapshot_prompt_cache`.
+
+    Args:
+        cache (List[Any]): The model's cache.
+        snapshot (List[Any]): The snapshot returned by
+            :func:`snapshot_prompt_cache`.
+    """
+    for c, s in zip(cache, snapshot):
+        c.restore(s)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -145,6 +184,20 @@ class _BaseCache:
 
     def is_trimmable(self):
         return False
+
+    def snap(self):
+        """
+        Snapshot the cache state for exact rollback. Override in
+        subclasses that mutate state during a forward.
+        """
+        return None
+
+    def restore(self, snapshot):
+        """
+        Restore the cache to the state captured by :meth:`snap`. Default
+        is a no-op for caches with no mutable state.
+        """
+        return
 
     def size(self):
         """
@@ -215,6 +268,15 @@ class ConcatenateKVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    def snap(self):
+        # ConcatenateKVCache replaces keys/values by mx.concatenate, so the
+        # snapshot must hold the pre-update array references along with the
+        # offset; restoring all three reverts any intervening appends.
+        return (self.offset, self.keys, self.values)
+
+    def restore(self, snapshot):
+        self.offset, self.keys, self.values = snapshot
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
@@ -311,6 +373,14 @@ class QuantizedKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def snap(self):
+        # Writes happen in pre-allocated buffer at positions >= self.offset;
+        # restoring offset hides them (next write reuses the slots).
+        return self.offset
+
+    def restore(self, snapshot):
+        self.offset = snapshot
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
@@ -379,6 +449,14 @@ class KVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    def snap(self):
+        # Writes happen at positions [prev_offset, offset); restoring the
+        # offset reverts the verify-forward writes without copying tensors.
+        return self.offset
+
+    def restore(self, snapshot):
+        self.offset = snapshot
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
@@ -548,6 +626,15 @@ class RotatingKVCache(_BaseCache):
         self._idx -= n
         return n
 
+    def snap(self):
+        # Pre-rotation writes are in-place at [_idx, _idx + S); restoring
+        # offset and _idx reverts them. Post-rotation cases also restore
+        # by reverting _idx.
+        return (self.offset, self._idx)
+
+    def restore(self, snapshot):
+        self.offset, self._idx = snapshot
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("RotatingKVCache Quantization NYI")
 
@@ -688,6 +775,18 @@ class ArraysCache(_BaseCache):
         if self.left_padding is not None:
             self.left_padding -= N
 
+    def snap(self):
+        # The model __call__ reassigns cache[i] by reference and advance()
+        # reassigns lengths/left_padding via -=, so a by-reference snapshot
+        # of the list and these two arrays is sufficient -- the originals
+        # are never mutated in place during a forward.
+        return (list(self.cache), self.lengths, self.left_padding)
+
+    def restore(self, snapshot):
+        self.cache = list(snapshot[0])
+        self.lengths = snapshot[1]
+        self.left_padding = snapshot[2]
+
     def make_mask(self, N: int):
         if self.left_padding is not None:
             pos = mx.arange(N)
@@ -793,6 +892,12 @@ class ChunkedKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def snap(self):
+        return (self.offset, self.start_position)
+
+    def restore(self, snapshot):
+        self.offset, self.start_position = snapshot
+
     @property
     def meta_state(self):
         return tuple(map(str, (self.chunk_size, self.start_position)))
@@ -825,6 +930,13 @@ class CacheList(_BaseCache):
         for c in self.caches:
             m = c.trim(n)
         return m
+
+    def snap(self):
+        return [c.snap() for c in self.caches]
+
+    def restore(self, snapshot):
+        for c, s in zip(self.caches, snapshot):
+            c.restore(s)
 
     @property
     def state(self):
@@ -1007,6 +1119,12 @@ class BatchKVCache(_BaseCache):
         self._idx -= n
         self.offset -= n
         return n
+
+    def snap(self):
+        return (self._idx, self.offset)
+
+    def restore(self, snapshot):
+        self._idx, self.offset = snapshot
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
         return create_causal_mask(
@@ -1323,6 +1441,12 @@ class BatchRotatingKVCache(_BaseCache):
         self._idx -= n
         self.offset -= n
         return n
+
+    def snap(self):
+        return (self._offset, self._idx, self.offset)
+
+    def restore(self, snapshot):
+        self._offset, self._idx, self.offset = snapshot
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("BatchRotatingKVCache Quantization NYI")
