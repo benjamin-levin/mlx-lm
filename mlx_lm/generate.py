@@ -1508,6 +1508,7 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        prefer_prefill_when_pending: bool = False,
         stream=None,
     ):
         self.model = model
@@ -1519,6 +1520,7 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self._prefer_prefill_when_pending = prefer_prefill_when_pending
 
         self._stream = stream or generation_stream
 
@@ -1770,8 +1772,27 @@ class BatchGenerator:
         generation_responses = []
         prompt_responses = []
 
+        # With prefer_prefill_when_pending=True, skip the decode step when
+        # any prefill work is queued or in flight, unless the decode batch is
+        # already saturated. This matters most for long-context multi-agent
+        # workloads where the prefill chunk (~1s+ at 32k context) and a
+        # single decode step (~10ms) share the same GPU: interleaving them
+        # 1:1 — the default scheduler — drops already-decoding requests to
+        # near-zero tok/s while another request is prefilling. Pausing the
+        # decode lets the batch decode together at native speed once
+        # prefill catches up.
+        pending_prefill = self._prefer_prefill_when_pending and (
+            len(self._unprocessed_sequences) > 0
+            or len(self._currently_processing) > 0
+            or len(self._prompt_batch) > 0
+        )
+        saturated = len(self._generation_batch) >= self.completion_batch_size
+        do_decode = len(self._generation_batch) > 0 and (
+            not pending_prefill or saturated
+        )
+
         # Generate tokens first
-        if len(self._generation_batch) > 0:
+        if do_decode:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
@@ -1779,7 +1800,7 @@ class BatchGenerator:
                 mx.clear_cache()
 
         # Exit early because we already have our hands full with decoding
-        if len(self._generation_batch) >= self.completion_batch_size:
+        if saturated:
             return prompt_responses, generation_responses
 
         # Check if we have sequences and add them to the prompt batch
