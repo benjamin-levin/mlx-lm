@@ -1,3 +1,42 @@
+# `benjamin-levin/mlx-lm` — fork of [`ml-explore/mlx-lm`](https://github.com/ml-explore/mlx-lm)
+
+> **Interim fork**: carries seven in-flight upstream draft PRs assembled into `main` (plus one on its own branch) so users can install the full Python-level optimization stack as one piece while the PRs land upstream individually. Will be retired once each PR merges into `ml-explore/mlx-lm`.
+>
+> `setup.py` pins `mlx` to the matching [`benjamin-levin/mlx` fork](https://github.com/benjamin-levin/mlx) so the C++/Metal-level optimizations stack with the Python-level ones. Building requires Xcode CLT + CMake.
+
+## What's different from upstream
+
+Measured impact (M4 Max 36 GB, Qwen3.6-35B-A3B-4bit unless noted; per-PR isolated re-measurement lives in each draft PR's body):
+
+| Feature | Effect | Draft PR |
+|---|---|---|
+| **`BatchGenerator(prefer_prefill_when_pending=True)`** — opt-in scheduling fix: pauses decode while any prefill chunk is queued, so N>1 batches decode together at native batched speed instead of starving while one request prefills. Default off. | **2.58× @ N=3 ctx=8k, 1.71× @ N=3 ctx=32k**, ±0.4% (no-op) at N=1. | [#1](https://github.com/benjamin-levin/mlx-lm/pull/1) |
+| **Opt-in bf16 GDN state** (`MLX_LM_GDN_STATE_BF16=1`) — allocates the Qwen3-Next gated-delta recurrent state as bf16 instead of fp32 to halve per-step state bandwidth. Teacher-forced KL ≤ 0.0068, top-1 match 95-96/96. | Kernel −8.9%; e2e modest in this fork's vanilla baseline, larger when stacked with the rest. | [#2](https://github.com/benjamin-levin/mlx-lm/pull/2) |
+| **Qwen3-Next MoE compile-block** — wraps the routing and post-expert blend math in `@mx.compile` helpers so each MoE layer dispatches fewer graph entries per token. Heavy `switch_mlp` / `shared_expert` calls untouched. | Bit-exact; +0.4–1.1% e2e in isolation (within noise on this baseline — kept as structural cleanup). | [#3](https://github.com/benjamin-levin/mlx-lm/pull/3) |
+| **SnapKV long-context KV compression** — opt-in `snapkv=dict(...)` kwarg on `generate_step` plus a new `SnapKVCache`. Captures last-window queries to score positions, keeps sink + top-k + recent window, drops the rest. | **1.21× @ 32k, 1.68× @ 95k, 1.94× @ 128k.** Clean no-op below 49k length gate. | [#4](https://github.com/benjamin-levin/mlx-lm/pull/4) |
+| **Depth-1 MTP speculative decoding** — library API (`mtp_generate_step`) reusing the MTP head shipped with upstream Qwen3-Next / Qwen3.5-MoE checkpoints. Bit-exact under greedy decoding. | **1.13–1.21×** across echo / code / open-gen / qa-short workloads. Depth-2+ confirmed worse on M-series (always slower than d=1). | [#5](https://github.com/benjamin-levin/mlx-lm/pull/5) |
+| **Persistent disk-backed prompt cache** — opt-in `disk_cache_dir` kwarg on `LRUPromptCache` + matching CLI flags on `mlx_lm.server`. Atomic safetensors writes, LRU byte-budget eviction. | **1477–4585× TTFT speedup** on cached prefixes (4k–96k), bit-exact. | [#6](https://github.com/benjamin-levin/mlx-lm/pull/6) |
+| **Generic cache `snap()` / `restore()` + bit-exact PLD generator** — adds `snap()`/`restore()` to every built-in cache class plus a new `prompt_lookup_generate_step` using snapshot+restore for bit-exact rollback. Unlocks PLD on non-trimmable caches (GDN, Mamba `ArraysCache`) that the existing trim-based PLD doesn't support. | Bit-exact (10/10 prompts vs AR). **1.40–1.68× on GDN ArraysCache echo/code-edit workloads** — previously unreachable. Snap/restore overhead 0.04–0.14 μs per cache class. | [#8](https://github.com/benjamin-levin/mlx-lm/pull/8) |
+| *(Not in `main`)* **Auto-speculative router** — opt-in `auto_speculative=True` kwarg on `generate_step` that routes between PLD and plain AR based on prompt length, n-gram density, and a 16-token PLD probe. | Conflicts with the bit-exact PLD chosen for `main` (both define `prompt_lookup_generate_step`). Available on the `auto-speculative-router` branch — `git checkout auto-speculative-router` if you want it. | [#7](https://github.com/benjamin-levin/mlx-lm/pull/7) |
+
+### Why fusions and rollback primitives dominate this stack
+
+The M4 series and below have **no native int4 / int8 GPU matmul instructions** — M5's Neural Accelerators added these, but anything M4 or earlier dequantizes every quantized weight to bf16 in registers before the matmul fires, on every use. KV-quant in particular only pays off when the dequant is fused into the attention kernel (the stock 3-launch quantized-SDPA path is *slower* than bf16 SDPA at long context). Most of the fusions in the matching [mlx fork](https://github.com/benjamin-levin/mlx) and the speculative-decoding paths here exist to amortize that dequant cost, or to bypass it entirely by reducing the number of times each weight is touched per generated token.
+
+## Install
+
+```bash
+pip install git+https://github.com/benjamin-levin/mlx-lm.git@main
+```
+
+This installs `mlx-lm` from the fork and auto-pulls the matching [mlx fork](https://github.com/benjamin-levin/mlx) via `setup.py`. Build takes ~5–10 min on M-series (Xcode CLT + CMake required).
+
+## Context
+
+These changes were extracted from an [optimization study](https://github.com/benjamin-levin/mlx-fast) of 28 strategies attempted on Qwen3.6-35B-A3B-4bit on M4 Max (13 shipped, 15 documented as dead ends, with per-strategy methodology + measurement). Each draft PR on this fork has the full per-feature methodology, in-PR re-measurement, and any honest corrections vs originally-claimed wins.
+
+---
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
