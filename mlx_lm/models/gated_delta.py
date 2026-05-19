@@ -1,8 +1,26 @@
+import os
 from functools import partial
 from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+
+
+def _state_dtype() -> mx.Dtype:
+    """Allocation dtype for the GDN recurrent state.
+
+    Defaults to ``float32``. Opt in to ``bfloat16`` by setting the
+    environment variable ``MLX_LM_GDN_STATE_BF16=1``. The Metal kernel
+    accumulator stays fp32 either way (``state[i]`` is a local
+    ``float``); only the heap-resident state storage changes, halving
+    per-step state bandwidth (~90 MB/step at Qwen3-Next 32k N=3).
+
+    Quality (Qwen3-Next-80B-A3B-4bit, teacher-forced 96 tokens):
+      KL <= 0.0068 (gate 0.01); top-1 match 95-96/96.
+    """
+    if os.environ.get("MLX_LM_GDN_STATE_BF16") == "1":
+        return mx.bfloat16
+    return mx.float32
 
 
 @partial(mx.compile, shapeless=True)
@@ -237,7 +255,7 @@ def gated_delta_ops(
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
     if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=_state_dtype())
 
     if (repeat_factor := Hv // Hk) > 1:
         q = mx.repeat(q, repeat_factor, -2)
@@ -276,7 +294,13 @@ def gated_delta_update(
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=_state_dtype())
+    elif os.environ.get("MLX_LM_GDN_STATE_BF16") == "1" and state.dtype == mx.float32:
+        # A cache populated by a prior run (or seeded externally) with
+        # fp32 state — coerce on first use. Subsequent steps preserve
+        # storage dtype because the kernel allocates state_out with
+        # the same dtype as state_in.
+        state = state.astype(mx.bfloat16)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state, mask)

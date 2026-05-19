@@ -1,7 +1,9 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import os
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,6 +13,7 @@ from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
+    _state_dtype,
     gated_delta_kernel,
     gated_delta_ops,
     gated_delta_update,
@@ -3219,6 +3222,119 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+    def test_gated_delta_state_dtype_default_fp32(self):
+        # Default (env var unset) keeps the recurrent state in fp32 — the
+        # historical behavior, unchanged.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MLX_LM_GDN_STATE_BF16", None)
+            self.assertEqual(_state_dtype(), mx.float32)
+
+            B, T, Hk, Hv, Dk, Dv = 1, 1, 2, 2, 32, 32
+            q = mx.random.normal(shape=(B, T, Hk, Dk))
+            k = mx.random.normal(shape=(B, T, Hk, Dk))
+            v = mx.random.normal(shape=(B, T, Hv, Dv))
+            a = mx.random.normal(shape=(B, T, Hv))
+            b = mx.random.normal(shape=(B, T, Hv))
+            A_log = mx.zeros((Hv,))
+            dt_bias = mx.ones((Hv,))
+
+            _, state = gated_delta_update(
+                q, k, v, a, b, A_log, dt_bias, state=None, use_kernel=False
+            )
+            self.assertEqual(state.dtype, mx.float32)
+
+    def test_gated_delta_state_dtype_bf16_opt_in(self):
+        # MLX_LM_GDN_STATE_BF16=1 switches the freshly allocated state to bf16
+        # and coerces an externally seeded fp32 state on first use.
+        with mock.patch.dict(os.environ, {"MLX_LM_GDN_STATE_BF16": "1"}):
+            self.assertEqual(_state_dtype(), mx.bfloat16)
+
+            B, T, Hk, Hv, Dk, Dv = 1, 1, 2, 2, 32, 32
+            q = mx.random.normal(shape=(B, T, Hk, Dk))
+            k = mx.random.normal(shape=(B, T, Hk, Dk))
+            v = mx.random.normal(shape=(B, T, Hv, Dv))
+            a = mx.random.normal(shape=(B, T, Hv))
+            b = mx.random.normal(shape=(B, T, Hv))
+            A_log = mx.zeros((Hv,))
+            dt_bias = mx.ones((Hv,))
+
+            _, state = gated_delta_update(
+                q, k, v, a, b, A_log, dt_bias, state=None, use_kernel=False
+            )
+            self.assertEqual(state.dtype, mx.bfloat16)
+
+            seed_state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+            _, state2 = gated_delta_update(
+                q, k, v, a, b, A_log, dt_bias, state=seed_state, use_kernel=False
+            )
+            self.assertEqual(state2.dtype, mx.bfloat16)
+
+    def test_gated_delta_bf16_state_matches_fp32_state(self):
+        # bf16 state should track fp32 state closely over a short rollout.
+        # Replay identical fp32 inputs against fp32 and bf16 recurrent state
+        # and assert final-state and final-output cosine similarity >= 0.99.
+        mx.random.seed(7)
+        N_STEPS = 16
+        B, Hk, Hv, Dk, Dv = 1, 4, 4, 64, 64
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.ones((Hv,))
+
+        all_q = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_k = mx.random.normal(shape=(N_STEPS, B, 1, Hk, Dk)) * 0.1
+        all_v = mx.random.normal(shape=(N_STEPS, B, 1, Hv, Dv)) * 0.1
+        all_a = -7.0 + mx.random.normal(shape=(N_STEPS, B, 1, Hv)) * 0.3
+        all_b = mx.random.normal(shape=(N_STEPS, B, 1, Hv))
+        mx.eval(all_q, all_k, all_v, all_a, all_b, A_log, dt_bias)
+
+        # fp32 reference rollout (env var unset)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MLX_LM_GDN_STATE_BF16", None)
+            state_fp32 = None
+            y_fp32_last = None
+            for t in range(N_STEPS):
+                y_fp32_last, state_fp32 = gated_delta_update(
+                    all_q[t],
+                    all_k[t],
+                    all_v[t],
+                    all_a[t],
+                    all_b[t],
+                    A_log,
+                    dt_bias,
+                    state_fp32,
+                    use_kernel=False,
+                )
+                mx.eval(y_fp32_last, state_fp32)
+
+        # bf16 state rollout (env var set)
+        with mock.patch.dict(os.environ, {"MLX_LM_GDN_STATE_BF16": "1"}):
+            state_bf16 = None
+            y_bf16_last = None
+            for t in range(N_STEPS):
+                y_bf16_last, state_bf16 = gated_delta_update(
+                    all_q[t],
+                    all_k[t],
+                    all_v[t],
+                    all_a[t],
+                    all_b[t],
+                    A_log,
+                    dt_bias,
+                    state_bf16,
+                    use_kernel=False,
+                )
+                mx.eval(y_bf16_last, state_bf16)
+
+        self.assertEqual(state_fp32.dtype, mx.float32)
+        self.assertEqual(state_bf16.dtype, mx.bfloat16)
+
+        def cos_sim(x, y):
+            x = x.flatten().astype(mx.float32)
+            y = y.flatten().astype(mx.float32)
+            denom = mx.sqrt((x * x).sum()) * mx.sqrt((y * y).sum())
+            return (x * y).sum() / mx.maximum(denom, mx.array(1e-12))
+
+        self.assertGreaterEqual(cos_sim(state_fp32, state_bf16).item(), 0.99)
+        self.assertGreaterEqual(cos_sim(y_fp32_last, y_bf16_last).item(), 0.99)
 
 
 if __name__ == "__main__":
