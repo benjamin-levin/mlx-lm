@@ -574,6 +574,122 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_qwen3_next_moe_compile_helpers(self):
+        # Validates that the @mx.compile-wrapped routing/combine helpers
+        # in qwen3_next produce bit-identical outputs to the original
+        # inline math they replaced.
+        from mlx_lm.models.qwen3_next import (
+            _moe_combine,
+            _moe_route_norm,
+            _moe_route_raw,
+        )
+
+        mx.random.seed(0)
+        B, T, E, K, D = 2, 3, 8, 4, 16
+
+        gates_logits = mx.random.normal(shape=(B, T, E))
+
+        # Reference (uncompiled inline) implementations.
+        def ref_route_norm(g, k):
+            g = mx.softmax(g, axis=-1, precise=True)
+            inds = mx.argpartition(g, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(g, inds, axis=-1)
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+            return inds, scores
+
+        def ref_route_raw(g, k):
+            g = mx.softmax(g, axis=-1, precise=True)
+            inds = mx.argpartition(g, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(g, inds, axis=-1)
+            return inds, scores
+
+        inds_c, scores_c = _moe_route_norm(gates_logits, K)
+        inds_r, scores_r = ref_route_norm(gates_logits, K)
+        self.assertTrue(mx.array_equal(inds_c, inds_r))
+        self.assertTrue(mx.allclose(scores_c, scores_r, atol=0, rtol=0))
+
+        inds_c, scores_c = _moe_route_raw(gates_logits, K)
+        inds_r, scores_r = ref_route_raw(gates_logits, K)
+        self.assertTrue(mx.array_equal(inds_c, inds_r))
+        self.assertTrue(mx.allclose(scores_c, scores_r, atol=0, rtol=0))
+
+        # _moe_combine: weighted expert sum + sigmoid-gated shared blend.
+        expert_out = mx.random.normal(shape=(B, T, K, D))
+        scores = mx.random.uniform(shape=(B, T, K))
+        shared_y = mx.random.normal(shape=(B, T, D))
+        shared_gate_logit = mx.random.normal(shape=(B, T, 1))
+
+        y_c = _moe_combine(expert_out, scores, shared_y, shared_gate_logit)
+        y_ref = (expert_out * scores[..., None]).sum(axis=-2) + (
+            mx.sigmoid(shared_gate_logit) * shared_y
+        )
+        self.assertTrue(mx.allclose(y_c, y_ref, atol=0, rtol=0))
+
+    def test_qwen3_next_sparse_moe_block(self):
+        # End-to-end check: a tiny Qwen3NextSparseMoeBlock evaluated through
+        # the compile-wrapped path must equal a from-scratch reference that
+        # uses the same weights but runs the original inline routing/blend
+        # math. Covers both norm_topk_prob settings.
+        from mlx_lm.models import qwen3_next
+
+        def _build_args(norm_topk_prob):
+            return qwen3_next.ModelArgs(
+                model_type="qwen3_next",
+                hidden_size=32,
+                num_hidden_layers=1,
+                intermediate_size=32,
+                num_attention_heads=4,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=16,
+                linear_value_head_dim=16,
+                linear_conv_kernel_dim=3,
+                num_experts=8,
+                num_experts_per_tok=2,
+                decoder_sparse_step=1,
+                shared_expert_intermediate_size=32,
+                mlp_only_layers=[],
+                moe_intermediate_size=32,
+                rms_norm_eps=1e-5,
+                vocab_size=128,
+                num_key_value_heads=2,
+                rope_theta=1000.0,
+                partial_rotary_factor=0.5,
+                max_position_embeddings=64,
+                head_dim=16,
+                norm_topk_prob=norm_topk_prob,
+            )
+
+        for norm_topk_prob in (True, False):
+            mx.random.seed(0)
+            args = _build_args(norm_topk_prob)
+            block = qwen3_next.Qwen3NextSparseMoeBlock(args)
+            mx.eval(block.parameters())
+
+            B, T = 2, 4
+            x = mx.random.normal(shape=(B, T, args.hidden_size))
+
+            # Output through the compile-wrapped helpers.
+            y = block(x)
+
+            # Reference: replay the original inline routing/blend math
+            # against the same submodules.
+            gates = block.gate(x)
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            k = block.top_k
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            if norm_topk_prob:
+                scores = scores / scores.sum(axis=-1, keepdims=True)
+            expert_out = block.switch_mlp(x, inds)
+            y_ref = (expert_out * scores[..., None]).sum(axis=-2)
+            shared_y = block.shared_expert(x)
+            shared_y = mx.sigmoid(block.shared_expert_gate(x)) * shared_y
+            y_ref = y_ref + shared_y
+
+            self.assertEqual(y.shape, y_ref.shape)
+            self.assertTrue(mx.allclose(y, y_ref, atol=0, rtol=0))
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
