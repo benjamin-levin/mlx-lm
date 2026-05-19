@@ -303,13 +303,25 @@ class TestMTPGenerateStep(unittest.TestCase):
         )
         base = qwen3_next.Model(args)
 
-        # mtp_generate_step expects a model wrapper exposing
-        # ``language_model.model`` (the inner Qwen3-Next text model).
-        # The standalone qwen3_next.Model IS the text model wrapper, so
-        # we wrap it once for this test.
+        # mtp_generate_step expects a model wrapper that:
+        #   - exposes ``language_model.model`` for the inner Qwen3-Next
+        #     text-model hand-off (used by _full_forward_capture, etc.),
+        #   - also forwards top-level attribute access (``layers``,
+        #     ``make_cache``, ``lm_head``, etc.) so
+        #     ``cache.make_prompt_cache(wrapper)`` and similar see the
+        #     same surface a real ``Qwen3NextForCausalLM`` would expose.
+        # The standalone ``qwen3_next.Model`` IS the text model wrapper
+        # (it has ``.model``, ``.layers``, ``.lm_head`` itself), so the
+        # test wrapper delegates everything else to it.
         class _Wrapper:
             def __init__(self, m):
                 self.language_model = m
+
+            def __getattr__(self, name):
+                # Only invoked when normal attribute lookup fails.
+                # Delegate to the inner model for ``layers``,
+                # ``make_cache``, ``lm_head``, etc.
+                return getattr(self.language_model, name)
 
         wrapper = _Wrapper(base)
 
