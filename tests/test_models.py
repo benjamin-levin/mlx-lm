@@ -3453,5 +3453,222 @@ class TestModels(unittest.TestCase):
         self.assertGreaterEqual(cos_sim(y_fp32_last, y_bf16_last).item(), 0.99)
 
 
+class TestCacheSnapRestore(unittest.TestCase):
+    """Snap/restore round-trip tests for every built-in cache class.
+
+    The contract: take a snapshot, perform additional updates, restore,
+    and confirm the cache state matches what would be produced by
+    stopping at the snapshot point.
+    """
+
+    def test_base_cache_snap_is_noop(self):
+        from mlx_lm.models.cache import _BaseCache
+
+        c = _BaseCache()
+        snap = c.snap()
+        self.assertIsNone(snap)
+        # restore must accept and be a no-op.
+        c.restore(snap)
+
+    def test_kv_cache_snap_restore(self):
+        from mlx_lm.models.cache import KVCache
+
+        cache = KVCache()
+        x1 = mx.random.uniform(shape=(1, 2, 3, 8))
+        cache.update_and_fetch(x1, x1)
+
+        snap = cache.snap()
+        offset_at_snap = cache.offset
+        keys_at_snap = cache.keys[..., :offset_at_snap, :].astype(mx.float32)
+
+        # Append more, then roll back.
+        x2 = mx.random.uniform(shape=(1, 2, 5, 8))
+        cache.update_and_fetch(x2, x2)
+        self.assertEqual(cache.offset, 8)
+
+        cache.restore(snap)
+        self.assertEqual(cache.offset, offset_at_snap)
+        self.assertTrue(
+            mx.array_equal(
+                cache.keys[..., :offset_at_snap, :].astype(mx.float32), keys_at_snap
+            )
+        )
+
+        # Subsequent writes land at the rolled-back offset.
+        x3 = mx.random.uniform(shape=(1, 2, 2, 8))
+        cache.update_and_fetch(x3, x3)
+        self.assertEqual(cache.offset, offset_at_snap + 2)
+        self.assertTrue(
+            mx.array_equal(cache.keys[..., offset_at_snap : offset_at_snap + 2, :], x3)
+        )
+
+    def test_quantized_kv_cache_snap_restore(self):
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        cache = QuantizedKVCache(group_size=64, bits=8)
+        x1 = mx.random.uniform(shape=(1, 2, 3, 64))
+        cache.update_and_fetch(x1, x1)
+        snap = cache.snap()
+        offset_at_snap = cache.offset
+
+        x2 = mx.random.uniform(shape=(1, 2, 4, 64))
+        cache.update_and_fetch(x2, x2)
+        self.assertEqual(cache.offset, 7)
+
+        cache.restore(snap)
+        self.assertEqual(cache.offset, offset_at_snap)
+
+        # Next write reuses the slots starting at restored offset.
+        x3 = mx.random.uniform(shape=(1, 2, 2, 64))
+        k_out, _ = cache.update_and_fetch(x3, x3)
+        self.assertEqual(cache.offset, offset_at_snap + 2)
+        self.assertEqual(k_out[0].shape[-2], offset_at_snap + 2)
+
+    def test_rotating_kv_cache_snap_restore(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        cache = RotatingKVCache(max_size=8, keep=0)
+        x = mx.random.uniform(shape=(1, 2, 3, 4))
+        cache.update_and_fetch(x, x)
+        snap = cache.snap()
+        offset_at_snap, idx_at_snap = cache.offset, cache._idx
+
+        # Do a couple of single-step writes (the path snap/restore is built
+        # for: speculative verify is always shape[2] == 1 per step).
+        for _ in range(3):
+            y = mx.random.uniform(shape=(1, 2, 1, 4))
+            cache.update_and_fetch(y, y)
+        self.assertEqual(cache.offset, 6)
+
+        cache.restore(snap)
+        self.assertEqual(cache.offset, offset_at_snap)
+        self.assertEqual(cache._idx, idx_at_snap)
+
+    def test_chunked_kv_cache_snap_restore(self):
+        from mlx_lm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(chunk_size=16)
+        x1 = mx.random.uniform(shape=(1, 2, 3, 8))
+        cache.update_and_fetch(x1, x1)
+        snap = cache.snap()
+        offset_at_snap = cache.offset
+        start_at_snap = cache.start_position
+
+        x2 = mx.random.uniform(shape=(1, 2, 4, 8))
+        cache.update_and_fetch(x2, x2)
+        self.assertEqual(cache.offset, 7)
+
+        cache.restore(snap)
+        self.assertEqual(cache.offset, offset_at_snap)
+        self.assertEqual(cache.start_position, start_at_snap)
+
+    def test_concatenate_kv_cache_snap_restore(self):
+        from mlx_lm.models.cache import ConcatenateKVCache
+
+        cache = ConcatenateKVCache()
+        x1 = mx.random.uniform(shape=(1, 2, 3, 8))
+        cache.update_and_fetch(x1, x1)
+        snap = cache.snap()
+        offset_at_snap = cache.offset
+        keys_at_snap = cache.keys.astype(mx.float32)
+        values_at_snap = cache.values.astype(mx.float32)
+
+        # Concatenate replaces keys/values by reference; snapshot must
+        # restore the pre-update references.
+        x2 = mx.random.uniform(shape=(1, 2, 2, 8))
+        cache.update_and_fetch(x2, x2)
+        self.assertEqual(cache.offset, 5)
+
+        cache.restore(snap)
+        self.assertEqual(cache.offset, offset_at_snap)
+        self.assertTrue(mx.array_equal(cache.keys.astype(mx.float32), keys_at_snap))
+        self.assertTrue(mx.array_equal(cache.values.astype(mx.float32), values_at_snap))
+
+    def test_arrays_cache_snap_restore(self):
+        from mlx_lm.models.cache import ArraysCache
+
+        cache = ArraysCache(size=2, left_padding=[1, 2])
+        a0 = mx.random.uniform(shape=(2, 4, 8))
+        a1 = mx.random.uniform(shape=(2, 4, 8))
+        cache[0] = a0
+        cache[1] = a1
+        # The model __call__ also reassigns lengths via advance(); model it
+        # here by setting one explicitly.
+        cache.prepare(lengths=[3, 4])
+        snap = cache.snap()
+        lengths_at_snap = cache.lengths
+        left_padding_at_snap = cache.left_padding
+
+        # Mutate as a forward would: reassign list slots by reference and
+        # advance() consumes one token.
+        new_a0 = mx.random.uniform(shape=(2, 4, 8))
+        cache[0] = new_a0
+        cache.advance(1)
+        self.assertFalse(mx.array_equal(cache.lengths, lengths_at_snap))
+
+        cache.restore(snap)
+        # Restored entries are bit-exact references to the originals.
+        self.assertTrue(mx.array_equal(cache[0], a0))
+        self.assertTrue(mx.array_equal(cache[1], a1))
+        self.assertTrue(mx.array_equal(cache.lengths, lengths_at_snap))
+        self.assertTrue(mx.array_equal(cache.left_padding, left_padding_at_snap))
+
+    def test_cache_list_snap_restore(self):
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        c0, c1 = KVCache(), KVCache()
+        cl = CacheList(c0, c1)
+        x = mx.random.uniform(shape=(1, 2, 3, 8))
+        c0.update_and_fetch(x, x)
+        c1.update_and_fetch(x, x)
+
+        snap = cl.snap()
+        # Mutate underlying caches.
+        y = mx.random.uniform(shape=(1, 2, 2, 8))
+        c0.update_and_fetch(y, y)
+        c1.update_and_fetch(y, y)
+        self.assertEqual(c0.offset, 5)
+        self.assertEqual(c1.offset, 5)
+
+        cl.restore(snap)
+        self.assertEqual(c0.offset, 3)
+        self.assertEqual(c1.offset, 3)
+
+    def test_snapshot_restore_helpers(self):
+        # Module-level helpers iterate over the cache list and dispatch to
+        # each cache's snap/restore.
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            KVCache,
+            restore_prompt_cache,
+            snapshot_prompt_cache,
+        )
+
+        kv = KVCache()
+        x = mx.random.uniform(shape=(1, 2, 3, 8))
+        kv.update_and_fetch(x, x)
+
+        ac = ArraysCache(size=1)
+        ac_a0 = mx.random.uniform(shape=(2, 4, 8))
+        ac[0] = ac_a0
+
+        cache = [kv, ac]
+        snap = snapshot_prompt_cache(cache)
+        self.assertEqual(len(snap), 2)
+
+        # Mutate both caches.
+        y = mx.random.uniform(shape=(1, 2, 2, 8))
+        kv.update_and_fetch(y, y)
+        new_ac0 = mx.random.uniform(shape=(2, 4, 8))
+        ac[0] = new_ac0
+        self.assertEqual(kv.offset, 5)
+        self.assertFalse(mx.array_equal(ac[0], ac_a0))
+
+        restore_prompt_cache(cache, snap)
+        self.assertEqual(kv.offset, 3)
+        # ArraysCache restored by-reference to the original entry.
+        self.assertTrue(mx.array_equal(ac[0], ac_a0))
+
+
 if __name__ == "__main__":
     unittest.main()
