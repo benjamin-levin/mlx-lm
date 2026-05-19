@@ -9,7 +9,13 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    RotatingKVCache,
+    SnapKVCache,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -3219,6 +3225,190 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+
+class TestSnapKVCache(unittest.TestCase):
+    def test_update_and_fetch_sliding_window(self):
+        # n_pin pinned positions + sliding recent window.
+        # Layout: keys[..., :n_pin, :] stays put; keys[..., n_pin:n_keep, :]
+        # is a fifo whose oldest L entries are evicted when L new arrive.
+        B, KV_H, D = 1, 2, 4
+        n_pin, n_window = 3, 5
+        n_keep = n_pin + n_window
+
+        # Mark each position with a distinct constant so we can track eviction.
+        keys_init = mx.broadcast_to(
+            mx.arange(n_keep, dtype=mx.float32).reshape(1, 1, n_keep, 1),
+            (B, KV_H, n_keep, D),
+        )
+        values_init = keys_init + 100.0
+
+        cache = SnapKVCache(
+            mx.array(keys_init),
+            mx.array(values_init),
+            logical_offset=n_keep,
+            n_pin=n_pin,
+        )
+
+        # Cache is intentionally not trimmable / not quantizable.
+        self.assertFalse(cache.is_trimmable())
+        self.assertFalse(hasattr(cache, "to_quantized"))
+        self.assertEqual(cache.size(), n_keep)
+        self.assertEqual(cache.offset, n_keep)
+        self.assertIsNone(cache.make_mask())
+
+        # Push one new token (L=1).
+        new_k = mx.full((B, KV_H, 1, D), 999.0, dtype=mx.float32)
+        new_v = mx.full((B, KV_H, 1, D), -999.0, dtype=mx.float32)
+        out_k, out_v = cache.update_and_fetch(new_k, new_v)
+
+        # Pinned region intact.
+        self.assertTrue(
+            mx.array_equal(out_k[..., :n_pin, :], keys_init[..., :n_pin, :])
+        )
+        # Oldest window entry (index n_pin) evicted, others shifted left,
+        # and new key placed at the tail.
+        expected_window = mx.concatenate(
+            [keys_init[..., n_pin + 1 : n_keep, :], new_k],
+            axis=-2,
+        )
+        self.assertTrue(mx.array_equal(out_k[..., n_pin:, :], expected_window))
+        expected_window_v = mx.concatenate(
+            [values_init[..., n_pin + 1 : n_keep, :], new_v],
+            axis=-2,
+        )
+        self.assertTrue(mx.array_equal(out_v[..., n_pin:, :], expected_window_v))
+        # Logical offset advances by L=1; physical shape stays constant.
+        self.assertEqual(cache.offset, n_keep + 1)
+        self.assertEqual(out_k.shape[-2], n_keep)
+
+        # Push a batch of L=2 tokens and check both still fit + oldest two evict.
+        new_k2 = mx.stack(
+            [
+                mx.full((B, KV_H, D), 11.0, dtype=mx.float32),
+                mx.full((B, KV_H, D), 22.0, dtype=mx.float32),
+            ],
+            axis=-2,
+        )
+        new_v2 = -new_k2
+        out_k2, _ = cache.update_and_fetch(new_k2, new_v2)
+        # Tail two slots == new keys in order.
+        self.assertTrue(mx.array_equal(out_k2[..., -2:, :], new_k2))
+        # Pin still untouched.
+        self.assertTrue(
+            mx.array_equal(out_k2[..., :n_pin, :], keys_init[..., :n_pin, :])
+        )
+        # Shape still n_keep, logical offset advanced by 2.
+        self.assertEqual(out_k2.shape[-2], n_keep)
+        self.assertEqual(cache.offset, n_keep + 3)
+
+    def test_n_pin_validation(self):
+        keys = mx.zeros((1, 1, 4, 2))
+        with self.assertRaises(ValueError):
+            SnapKVCache(keys, keys, logical_offset=4, n_pin=5)
+
+    def test_snapkv_cache_rejected_by_trim_helpers(self):
+        # SnapKVCache is intentionally not trimmable; a list containing it
+        # cannot be trimmed by the standard helper.
+        keys = mx.zeros((1, 1, 4, 2))
+        cache_list = [
+            KVCache(),
+            SnapKVCache(keys, keys, logical_offset=4, n_pin=1),
+        ]
+        self.assertFalse(can_trim_prompt_cache(cache_list))
+
+    def test_select_indices_orders_sink_topk_window(self):
+        from mlx_lm.snapkv import _snapkv_select_indices
+
+        # Synthetic shapes: H=4, KV_H=2 -> n_repeats=2.
+        B, H, KV_H, OW, T, D = 1, 4, 2, 8, 64, 16
+        n_sink, n_window, top_k = 4, 8, 6
+
+        # Boost specific mid positions so they win the top-K argpartition.
+        # Mid region is positions [n_sink, T - n_window) == [4, 56).
+        boost_positions = [10, 20, 30, 40, 50, 55]
+        keys_data = mx.random.normal(shape=(B, KV_H, T, D)) * 0.01
+        boost = mx.zeros_like(keys_data)
+        for p in boost_positions:
+            boost = mx.concatenate(
+                [
+                    boost[..., :p, :],
+                    mx.full((B, KV_H, 1, D), 50.0, dtype=boost.dtype),
+                    boost[..., p + 1 :, :],
+                ],
+                axis=-2,
+            )
+        keys = keys_data + boost
+
+        # Queries dot the boosted K values strongly; argpartition picks them.
+        queries = mx.ones((B, H, OW, D), dtype=mx.float32)
+
+        idx = _snapkv_select_indices(
+            queries,
+            keys,
+            top_k=top_k,
+            n_sink=n_sink,
+            n_window=n_window,
+            pool_kernel=1,
+            scale=1.0 / (D**0.5),
+        )
+
+        idx_list = idx.tolist()
+        # Output is sorted ascending.
+        self.assertEqual(idx_list, sorted(idx_list))
+        # int32 dtype.
+        self.assertEqual(idx.dtype, mx.int32)
+        # Sink positions present.
+        for p in range(n_sink):
+            self.assertIn(p, idx_list)
+        # Window positions present.
+        for p in range(T - n_window, T):
+            self.assertIn(p, idx_list)
+        # All boosted mid positions selected.
+        for p in boost_positions:
+            self.assertIn(p, idx_list)
+        # Total = sink + top_k + window.
+        self.assertEqual(len(idx_list), n_sink + top_k + n_window)
+
+    def test_select_indices_returns_all_when_mid_empty(self):
+        # When T <= n_sink + n_window the helper short-circuits and
+        # returns every index.
+        from mlx_lm.snapkv import _snapkv_select_indices
+
+        B, H, KV_H, OW, T, D = 1, 2, 1, 4, 6, 8
+        n_sink, n_window = 4, 4  # mid region is empty / negative
+        queries = mx.random.normal(shape=(B, H, OW, D))
+        keys = mx.random.normal(shape=(B, KV_H, T, D))
+        idx = _snapkv_select_indices(
+            queries,
+            keys,
+            top_k=10,
+            n_sink=n_sink,
+            n_window=n_window,
+            pool_kernel=1,
+            scale=1.0,
+        )
+        self.assertEqual(idx.tolist(), list(range(T)))
+
+    def test_select_indices_top_k_zero(self):
+        # top_k=0 -> keep only sink + window.
+        from mlx_lm.snapkv import _snapkv_select_indices
+
+        B, H, KV_H, OW, T, D = 1, 2, 1, 4, 32, 8
+        n_sink, n_window = 4, 4
+        queries = mx.random.normal(shape=(B, H, OW, D))
+        keys = mx.random.normal(shape=(B, KV_H, T, D))
+        idx = _snapkv_select_indices(
+            queries,
+            keys,
+            top_k=0,
+            n_sink=n_sink,
+            n_window=n_window,
+            pool_kernel=1,
+            scale=1.0,
+        )
+        expected = list(range(n_sink)) + list(range(T - n_window, T))
+        self.assertEqual(idx.tolist(), expected)
 
 
 if __name__ == "__main__":
