@@ -24,7 +24,13 @@ setup(
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
     install_requires=[
-        f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
+        # Fork-only: pull the matching mlx fork so the C++/Metal-level
+        # optimizations (fused_qsdpa, fused_swiglu_gather_qmv) stack on top
+        # of the Python-level features in this mlx-lm fork. Building this
+        # requires Xcode command-line tools + CMake at install time.
+        # To use the upstream PyPI mlx instead, replace this line with:
+        #     f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
+        "mlx @ git+https://github.com/benjamin-levin/mlx.git@main; platform_system == 'Darwin'",
         "numpy",
         "transformers>=5.0.0",
         "sentencepiece",
