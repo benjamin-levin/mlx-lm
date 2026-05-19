@@ -3,6 +3,7 @@
 import copy
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -1656,13 +1657,49 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        *,
+        disk_cache_dir: Optional[str] = None,
+        disk_cache_bytes: int = 4 * (1024**3),
+        disk_cache_min_tokens: int = 256,
+    ):
+        """
+        Args:
+            max_size: Maximum number of in-memory KV caches to retain.
+            max_bytes: Maximum total bytes for the in-memory caches.
+            disk_cache_dir: If provided, the in-memory cache write-throughs
+                to this directory and probes it on miss, giving prefix
+                reuse that survives process restart. Default ``None``
+                disables disk persistence (zero overhead).
+            disk_cache_bytes: LRU byte budget for the on-disk cache when
+                ``disk_cache_dir`` is set. Oldest-by-last-used entries are
+                evicted to stay under this budget. Default 4 GB.
+            disk_cache_min_tokens: Skip persistence for caches shorter
+                than this many tokens (write/read overhead dominates the
+                prefill win at short prefixes). Default 256.
+        """
         self.max_size = max_size
         self.max_bytes = max_bytes
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+
+        # Disk-backed prefix cache (opt-in). Lazily initialized per
+        # model_key on first use; ``None`` here means "feature disabled".
+        self._disk_cache_dir: Optional[Path] = (
+            Path(disk_cache_dir).expanduser() if disk_cache_dir else None
+        )
+        self._disk_cache_bytes = int(disk_cache_bytes)
+        self._disk_cache_min_tokens = int(disk_cache_min_tokens)
+        # model_key -> DiskPromptCacheIndex
+        self._disk_indices: Dict[Any, Any] = {}
+        # model_key -> sorted (by length asc) list of stored token lists
+        self._disk_token_lists: Dict[Any, List[List[int]]] = {}
+        self._disk_indices_loaded: set = set()
 
     def __len__(self):
         return len(self._lru)
@@ -1690,6 +1727,16 @@ class LRUPromptCache:
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+
+        # In-memory miss. If disk persistence is enabled, probe the
+        # on-disk index for the longest stored prefix; if a hit is
+        # found, re-materialize it into the in-memory trie so subsequent
+        # lookups take the fast path.
+        if self._disk_cache_dir is not None:
+            cached_len = 0  # in-memory gave us nothing; full miss
+            disk_hit = self._disk_lookup(model, tokens, cached_len)
+            if disk_hit is not None:
+                return disk_hit
 
         return None, tokens
 
@@ -1736,6 +1783,15 @@ class LRUPromptCache:
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
+        # Write-through to disk if disk persistence is enabled. Failures
+        # here must never crash inference - the in-memory insert has
+        # already succeeded.
+        if (
+            self._disk_cache_dir is not None
+            and len(tokens) >= self._disk_cache_min_tokens
+        ):
+            self._disk_put(model, list(tokens), prompt_cache)
+
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
     ):
@@ -1761,3 +1817,154 @@ class LRUPromptCache:
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
         return result
+
+    # ------------------------------------------------------------------
+    # Disk-backed prefix cache helpers (opt-in via disk_cache_dir).
+    # ------------------------------------------------------------------
+
+    def _disk_index_for(self, model: Any):
+        """Return (and lazily construct) the on-disk index for
+        ``model``."""
+        index = self._disk_indices.get(model)
+        if index is not None:
+            return index
+        from ..disk_prompt_cache import DiskPromptCacheIndex, model_id_for
+
+        index = DiskPromptCacheIndex(
+            self._disk_cache_dir,
+            model_id_for(model),
+            size_budget_bytes=self._disk_cache_bytes,
+            min_prefix_tokens=self._disk_cache_min_tokens,
+        )
+        self._disk_indices[model] = index
+        return index
+
+    def _load_disk_token_lists(self, model: Any) -> None:
+        """Populate ``self._disk_token_lists[model]`` from disk metadata
+        the first time it's needed for this model. O(n_entries) glob;
+        typical inventories are tens-to-hundreds of entries."""
+        if model in self._disk_indices_loaded:
+            return
+        index = self._disk_index_for(model)
+        token_lists = [m.tokens for m in index.iter_meta()]
+        token_lists.sort(key=len)
+        self._disk_token_lists[model] = token_lists
+        self._disk_indices_loaded.add(model)
+
+    def _longest_disk_prefix(
+        self, model: Any, tokens: List[int]
+    ) -> Optional[List[int]]:
+        """Linear scan for the longest stored token list that is a strict
+        prefix of ``tokens``. Returns ``None`` if no prefix is stored."""
+        best = None
+        best_len = 0
+        n = len(tokens)
+        for stored in self._disk_token_lists.get(model, ()):
+            sl = len(stored)
+            if sl > n or sl <= best_len:
+                continue
+            ok = True
+            for i in range(sl):
+                if stored[i] != tokens[i]:
+                    ok = False
+                    break
+            if ok:
+                best = stored
+                best_len = sl
+        return best
+
+    def _disk_lookup(
+        self,
+        model: Any,
+        tokens: List[int],
+        cached_len: int,
+    ) -> Optional["tuple"]:
+        """On in-memory miss, probe disk. If a longer prefix is stored
+        than ``cached_len``, load it, insert it into the in-memory trie,
+        and refetch (so the trie's trim/extend logic handles the tail).
+        Returns ``(cache, rest)`` on hit or ``None`` on miss."""
+        from ..disk_prompt_cache import hash_tokens, load_cached_prefix
+
+        try:
+            self._load_disk_token_lists(model)
+        except OSError:
+            return None
+        stored = self._longest_disk_prefix(model, tokens)
+        if stored is None or len(stored) <= cached_len:
+            return None
+
+        index = self._disk_index_for(model)
+        key = hash_tokens(stored, index.model_id)
+        loaded = load_cached_prefix(self._disk_cache_dir, key, index.model_id)
+        if loaded is None:
+            # Stale index entry - drop it from the in-memory token list
+            # cache so we don't keep probing a dead file.
+            try:
+                self._disk_token_lists[model].remove(stored)
+            except (ValueError, KeyError):
+                pass
+            return None
+
+        disk_cache, _disk_tokens = loaded
+        # Re-materialize into the in-memory trie under the "system"
+        # cache_type bucket so subsequent fetches hit the fast path.
+        try:
+            entry = LRUPromptCache.CacheEntry(
+                disk_cache,
+                sum(getattr(c, "nbytes", 0) for c in disk_cache),
+                "system",
+            )
+            self._n_bytes += entry.nbytes
+            self._n_bytes_by_type["system"] += entry.nbytes
+            prev = self._trie.add(model, stored, entry)
+            if prev is not None:
+                self._n_bytes -= prev.nbytes
+                self._n_bytes_by_type[prev.cache_type] -= prev.nbytes
+                self._lru.remove(model, stored)
+            self._lru.push(model, stored, "system")
+        except Exception:  # noqa: BLE001 - never crash on disk-rehydrate path
+            return None
+
+        # Refetch so the trie's trim-or-extend logic handles the tail
+        # between ``stored`` and the full ``tokens``.
+        result = self._trie.search(model, tokens)
+        if result.exact is not None:
+            cache_entry = self._trie.get(result.model, result.exact)
+            return copy.deepcopy(cache_entry.prompt_cache), []
+        short_length = len(result.shorter) if result.shorter is not None else 0
+        if result.longer is not None and result.common_prefix > short_length:
+            cache_entry = self._trie.get(result.model, result.longer)
+            if can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
+                prefix = min(len(tokens) - 1, result.common_prefix)
+                num_to_trim = len(result.longer) - prefix
+                trim_prompt_cache(cache, num_to_trim)
+                return cache, tokens[prefix:]
+        if short_length > 0:
+            cache_entry = self._trie.get(result.model, result.shorter)
+            return (
+                copy.deepcopy(cache_entry.prompt_cache),
+                tokens[short_length:],
+            )
+        return None
+
+    def _disk_put(self, model: Any, tokens: List[int], prompt_cache: List[Any]) -> None:
+        """Write-through to disk. All errors are logged and swallowed."""
+        try:
+            index = self._disk_index_for(model)
+            if not index.put(tokens, prompt_cache):
+                return
+            # Keep the in-memory token-list cache in sync so the next
+            # cold-miss lookup sees this new entry.
+            self._load_disk_token_lists(model)
+            bucket = self._disk_token_lists.setdefault(model, [])
+            if tokens not in bucket:
+                bucket.append(tokens)
+                bucket.sort(key=len)
+        except Exception:  # noqa: BLE001
+            # Disk failures must never break inference.
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "disk prompt-cache write-through failed", exc_info=True
+            )

@@ -1740,7 +1740,16 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    cli = model_provider.cli_args
+    disk_cache_dir = getattr(cli, "disk_prompt_cache_dir", None)
+    prompt_cache = LRUPromptCache(
+        cli.prompt_cache_size,
+        disk_cache_dir=disk_cache_dir,
+        disk_cache_bytes=(
+            getattr(cli, "disk_prompt_cache_bytes", None) or 4 * (1024**3)
+        ),
+        disk_cache_min_tokens=getattr(cli, "disk_prompt_cache_min_tokens", 256),
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1878,6 +1887,38 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--disk-prompt-cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Opt-in disk-backed prompt cache directory. When set, the "
+            "in-memory prompt cache is mirrored to this directory; on a "
+            "cold start the longest stored prefix is re-materialized into "
+            "the in-memory trie, avoiding a full re-prefill of long "
+            "system prompts. Default disabled (zero overhead)."
+        ),
+    )
+    parser.add_argument(
+        "--disk-prompt-cache-bytes",
+        type=_parse_size,
+        default=None,
+        help=(
+            "LRU byte budget for the on-disk prompt cache (default 4 GB). "
+            "Oldest-by-last-used entries are evicted to stay under this "
+            "budget. Has no effect unless --disk-prompt-cache-dir is set."
+        ),
+    )
+    parser.add_argument(
+        "--disk-prompt-cache-min-tokens",
+        type=int,
+        default=256,
+        help=(
+            "Skip on-disk persistence for prompts shorter than this many "
+            "tokens (default 256). Save/load overhead dominates the "
+            "prefill saving at short prefixes."
+        ),
     )
     parser.add_argument(
         "--pipeline",
