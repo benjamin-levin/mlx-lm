@@ -806,6 +806,72 @@ class TestGenerate(unittest.TestCase):
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, KVCache)
 
+    def test_prefer_prefill_when_pending_default_false(self):
+        # Default behavior must be unchanged: the new flag defaults to False.
+        gen = BatchGenerator(self.model, max_tokens=1)
+        self.assertFalse(gen._prefer_prefill_when_pending)
+
+    def test_prefer_prefill_when_pending_accepted_and_stored(self):
+        # Opting in stores the flag without affecting other init kwargs.
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            prefer_prefill_when_pending=True,
+        )
+        self.assertTrue(gen._prefer_prefill_when_pending)
+
+    def test_prefer_prefill_pauses_decode_when_prefill_pending(self):
+        # With the flag on, a step that has both queued prefill work and an
+        # in-flight decode batch (below saturation) should skip the decode
+        # this cycle and drain prefill first. With the flag off (default),
+        # the decode runs as usual.
+        prompt_a = self.tokenizer.encode("Write a long story about a cat")
+        prompt_b = self.tokenizer.encode("Write a long story about a dog")
+
+        def run(prefer_prefill):
+            gen = BatchGenerator(
+                self.model,
+                max_tokens=5,
+                prefill_batch_size=1,
+                prefill_step_size=4,
+                completion_batch_size=4,
+                prefer_prefill_when_pending=prefer_prefill,
+            )
+            # Insert prompt A and drive next() until prefill has completed
+            # and the sequence has been promoted into _generation_batch.
+            # With prefill_step_size=4 and a longer prompt, the first sequence
+            # needs multiple next() cycles to traverse prefill before it can
+            # start decoding.
+            gen.insert([prompt_a])
+            for _ in range(20):
+                gen.next()
+                if len(gen._generation_batch) == 1:
+                    break
+            self.assertEqual(len(gen._generation_batch), 1)
+            self.assertLess(len(gen._generation_batch), gen.completion_batch_size)
+
+            # Queue a second prompt so prefill work is now pending while a
+            # decode batch is in flight and not yet saturated.
+            gen.insert([prompt_b])
+            self.assertGreater(
+                len(gen._unprocessed_sequences)
+                + len(gen._currently_processing)
+                + len(gen._prompt_batch),
+                0,
+            )
+
+            tokens_before = gen._gen_tokens_counter
+            gen.next()
+            return gen._gen_tokens_counter - tokens_before
+
+        decoded_with_flag_off = run(prefer_prefill=False)
+        decoded_with_flag_on = run(prefer_prefill=True)
+
+        # Flag off: the in-flight request gets a decode token this cycle.
+        self.assertGreater(decoded_with_flag_off, 0)
+        # Flag on: decode is paused so prefill can run first.
+        self.assertEqual(decoded_with_flag_on, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
